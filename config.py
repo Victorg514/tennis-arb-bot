@@ -10,7 +10,7 @@ POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
 
 # Trading
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 MAX_BET_USDC = float(os.getenv("MAX_BET_USDC", "50"))
 MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.45"))
 SELL_TARGET_PRICE = float(os.getenv("SELL_TARGET_PRICE", "0.50"))

@@ -70,7 +70,7 @@ All config from environment variables via `.env`:
 | `POLY_API_SECRET` | — | CLOB API secret |
 | `POLY_API_PASSPHRASE` | — | CLOB API passphrase |
 | `POLY_PRIVATE_KEY` | — | Ethereum private key (Polygon) for signing orders |
-| `POLL_INTERVAL` | 30 | Seconds between Polymarket snapshots |
+| `POLL_INTERVAL` | 10 | Seconds between Polymarket snapshots |
 | `MAX_BET_USDC` | 50 | Max USDC to spend per trade |
 | `MAX_BUY_PRICE` | 0.45 | Won't buy if underdog price exceeds this |
 | `SELL_TARGET_PRICE` | 0.50 | Target sell price (the 50/50 reset price) |
