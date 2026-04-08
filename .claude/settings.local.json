@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c ':*)",
+      "Bash(python)",
+      "Bash(2>&1)",
+      "Bash(python test_withdrawal_detection.py)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['polymarket_client.py','withdrawal_monitor.py','main.py','test_withdrawal_detection.py','config.py']]; print\\('syntax OK'\\)\")"
+    ]
+  }
+}
