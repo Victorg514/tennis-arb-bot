@@ -1,0 +1,26 @@
+[Unit]
+Description=Tennis Withdrawal Arbitrage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/tennis-arb-bot
+EnvironmentFile=/opt/tennis-arb-bot/.env
+ExecStart=/opt/tennis-arb-bot/venv/bin/python /opt/tennis-arb-bot/main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tennis-arb-bot
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

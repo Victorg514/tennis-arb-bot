@@ -1,0 +1,27 @@
+#cloud-config
+# Provisions a fresh Ubuntu droplet for the tennis arbitrage bot.
+# Installs Python + creates the unprivileged service user. The actual
+# project files and .env are uploaded by deploy.sh after this runs.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - python3
+  - python3-venv
+  - python3-pip
+  - build-essential
+  - git
+  - curl
+  - ca-certificates
+
+users:
+  - name: bot
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+runcmd:
+  - mkdir -p /opt/tennis-arb-bot
+  - chown -R bot:bot /opt/tennis-arb-bot
+  - chmod 750 /opt/tennis-arb-bot
