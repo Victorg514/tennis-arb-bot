@@ -32,6 +32,12 @@ cd "$(dirname "$0")/.."  # repo root
   echo "Create one by copying .env.example and filling in your real Polymarket credentials."
   exit 1
 }
+[ -f sessions.jsonl ] || {
+  echo "ERROR: sessions.jsonl not found at repo root."
+  echo "Nitter requires at least one valid X session (JSONL format) to fetch tweets."
+  echo "Place authenticated X account cookies in sessions.jsonl before deploying."
+  exit 1
+}
 command -v curl >/dev/null || { echo "ERROR: curl is required"; exit 1; }
 command -v ssh  >/dev/null || { echo "ERROR: ssh is required";  exit 1; }
 command -v scp  >/dev/null || { echo "ERROR: scp is required";  exit 1; }
@@ -157,8 +163,8 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-# --- 5. Ship code + .env -------------------------------------------------
-echo "[5/6] Shipping project files + .env..."
+# --- 5. Ship code + .env + sessions.jsonl --------------------------------
+echo "[5/6] Shipping project files + .env + sessions.jsonl..."
 TARBALL=$(mktemp -t tennis-arb-bot.XXXXXX.tar.gz)
 trap 'rm -f "$TARBALL"' EXIT
 tar --exclude='./.git' \
@@ -167,17 +173,22 @@ tar --exclude='./.git' \
     --exclude='./venv' \
     --exclude='./.venv' \
     --exclude='./.env' \
+    --exclude='./sessions.jsonl' \
+    --exclude='./sessions.json' \
     --exclude='./deploy/.do-token' \
     -czf "$TARBALL" -C . .
 scp "${SSH_OPTS[@]}" "$TARBALL" "root@$IP:/tmp/tennis-arb-bot.tar.gz"
 scp "${SSH_OPTS[@]}" .env "root@$IP:/tmp/tennis-arb-bot.env"
+scp "${SSH_OPTS[@]}" sessions.jsonl "root@$IP:/tmp/tennis-arb-bot.sessions.jsonl"
 
 # --- 6. Install + start --------------------------------------------------
-echo "[6/6] Installing dependencies and starting systemd service..."
+echo "[6/6] Installing dependencies, starting Nitter + bot..."
 ssh "${SSH_OPTS[@]}" "root@$IP" bash <<'REMOTE'
 set -euo pipefail
 
-# Stop any prior version so we're not racing it during install
+# Stop the bot so we're not racing it during install. We do NOT stop the
+# Nitter containers — we want them to keep serving across redeploys, and
+# `docker compose up -d` is idempotent on unchanged services.
 systemctl stop tennis-arb-bot 2>/dev/null || true
 
 # Unpack code
@@ -190,13 +201,31 @@ rm /tmp/tennis-arb-bot.tar.gz
 if [ -d /opt/tennis-arb-bot/venv ]; then
   mv /opt/tennis-arb-bot/venv /opt/tennis-arb-bot.new/venv
 fi
+# Preserve any previously-generated nitter.conf with a real hmac key.
+# (See "First-deploy hmac key generation" below — once patched, the file
+# carries a randomized secret we don't want to overwrite from the tarball.)
+if [ -f /opt/tennis-arb-bot/nitter.conf ] \
+   && ! grep -q 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET' /opt/tennis-arb-bot/nitter.conf; then
+  cp /opt/tennis-arb-bot/nitter.conf /opt/tennis-arb-bot.new/nitter.conf
+fi
 rm -rf /opt/tennis-arb-bot
 mv /opt/tennis-arb-bot.new /opt/tennis-arb-bot
 
-# Install .env with restrictive perms
-mv /tmp/tennis-arb-bot.env /opt/tennis-arb-bot/.env
+# Install .env + sessions.jsonl with restrictive perms
+mv /tmp/tennis-arb-bot.env          /opt/tennis-arb-bot/.env
+mv /tmp/tennis-arb-bot.sessions.jsonl /opt/tennis-arb-bot/sessions.jsonl
 chown -R bot:bot /opt/tennis-arb-bot
-chmod 600 /opt/tennis-arb-bot/.env
+chmod 600 /opt/tennis-arb-bot/.env /opt/tennis-arb-bot/sessions.jsonl
+
+# First-deploy hmac key generation: replace the placeholder in nitter.conf
+# with a real random secret. Done in-place so subsequent deploys (which
+# preserve nitter.conf above) keep the same key — Nitter caches things
+# under it, so changing the key invalidates state needlessly.
+if grep -q 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET' /opt/tennis-arb-bot/nitter.conf; then
+  HMAC_KEY=$(openssl rand -hex 32)
+  sed -i "s|CHANGE_ME_TO_A_LONG_RANDOM_SECRET|${HMAC_KEY}|" /opt/tennis-arb-bot/nitter.conf
+  echo "      Generated new Nitter hmac key"
+fi
 
 # Build / refresh venv
 sudo -u bot bash -c '
@@ -208,6 +237,31 @@ sudo -u bot bash -c '
   ./venv/bin/pip install --quiet -U pip
   ./venv/bin/pip install --quiet -r requirements.txt
 '
+
+# Bring up Nitter + Redis. Idempotent: unchanged services stay running.
+echo "      Starting Nitter stack..."
+cd /opt/tennis-arb-bot
+docker compose up -d
+
+# Wait for Nitter to actually serve. First boot can take 30-60s while it
+# warms its session pool against X. We don't fail the deploy if Nitter
+# isn't ready in time — XSource degrades gracefully and falls through to
+# Sofascore/ESPN — but we log a clear warning.
+echo "      Waiting for Nitter on http://127.0.0.1:8080 ..."
+NITTER_OK=0
+for i in $(seq 1 30); do
+  if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:8080/EntryLists; then
+    NITTER_OK=1
+    echo "      Nitter is up."
+    break
+  fi
+  sleep 2
+done
+if [ "$NITTER_OK" -ne 1 ]; then
+  echo "      WARNING: Nitter did not respond within 60s. Last container logs:"
+  docker logs --tail 30 nitter || true
+  echo "      Bot will start anyway — XSource will fall back to Sofascore/ESPN."
+fi
 
 # Install + (re)start systemd unit
 cp /opt/tennis-arb-bot/deploy/tennis-arb-bot.service /etc/systemd/system/

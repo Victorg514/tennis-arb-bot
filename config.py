@@ -36,6 +36,14 @@ NEWS_CHECK_ENABLED = os.getenv("NEWS_CHECK_ENABLED", "true").lower() == "true"
 NEWS_CHECK_MODE = os.getenv("NEWS_CHECK_MODE", "log").lower()
 NEWS_CACHE_TTL = float(os.getenv("NEWS_CACHE_TTL", "30"))
 
+# X / Nitter source — top-priority news source. Scrapes @EntryLists (tennis
+# updates account) via a local Nitter instance. Tweets typically announce
+# withdrawals minutes before they show up on Sofascore/ESPN.
+X_SOURCE_ENABLED = os.getenv("X_SOURCE_ENABLED", "true").lower() == "true"
+X_NITTER_INSTANCE = os.getenv("X_NITTER_INSTANCE", "http://localhost:8080")
+X_ACCOUNT = os.getenv("X_ACCOUNT", "EntryLists")
+X_FETCH_COUNT = int(os.getenv("X_FETCH_COUNT", "40"))
+
 # Polymarket API
 POLY_CLOB_URL = "https://clob.polymarket.com"
 POLY_GAMMA_URL = "https://gamma-api.polymarket.com"

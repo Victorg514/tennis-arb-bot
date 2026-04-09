@@ -1,7 +1,11 @@
 [Unit]
 Description=Tennis Withdrawal Arbitrage Bot
-After=network-online.target
-Wants=network-online.target
+# Bot's XSource depends on the local Nitter container being up. We don't
+# hard-Requires docker.service so that a Docker outage doesn't stop the
+# bot from running with Sofascore/ESPN as fallbacks — XSource degrades
+# gracefully if localhost:8080 is unreachable.
+After=network-online.target docker.service
+Wants=network-online.target docker.service
 
 [Service]
 Type=simple

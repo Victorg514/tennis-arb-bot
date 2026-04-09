@@ -2,9 +2,9 @@
 News / tournament monitor — confirms withdrawals from external sources.
 
 Current role: observe a price-spike signal and check whether any external
-source (Sofascore, ESPN) independently reports a walkover or retirement
-for the same match. Runs in one of three modes controlled by
-`NEWS_CHECK_MODE` in config:
+source (X/@EntryLists, Sofascore, ESPN) independently reports a walkover
+or retirement for the same match. Runs in one of three modes controlled
+by `NEWS_CHECK_MODE` in config:
 
     log     — check every signal, log the result, do not change behavior.
               Use this first to measure the false-positive rate of the
@@ -15,9 +15,12 @@ for the same match. Runs in one of three modes controlled by
     trigger — future mode: let news drive trades directly (not wired up
               yet; see WithdrawalMonitor for the current signal path).
 
-The two sources run in order; the first one to find the match wins.
-Both are fetched in bulk ("today's scheduled tennis matches") and cached
-for NEWS_CACHE_TTL seconds so repeated lookups don't hammer upstream.
+Sources run in priority order; the first one to find the match wins.
+Order: X (@EntryLists via Nitter) → Sofascore → ESPN. X is checked first
+because EntryLists posts withdrawals well before structured APIs reflect
+them. Sofascore/ESPN are fetched in bulk ("today's scheduled tennis
+matches") and cached for NEWS_CACHE_TTL seconds. X is fetched as a recent
+tweet timeline and cached the same way.
 
 Match lookup is fuzzy by last-name on both players — Polymarket uses
 "Stefanos Sakellaridis" while Sofascore uses "Sakellaridis S." — so both
@@ -104,6 +107,128 @@ def _match_players(a_target: str, b_target: str, a_candidate: str, b_candidate: 
 # ----------------------------------------------------------------------
 # Sources
 # ----------------------------------------------------------------------
+
+# Keyword sets for parsing free-text tweets. Word-boundary matched, so
+# "WD" won't match "forward" and " ret " won't match "retreat". Order
+# matters only for the detail string — both are checked.
+_WALKOVER_KEYWORDS = (
+    "walkover", "w/o", "wd", "withdraw", "withdraws", "withdrew",
+    "withdrawn", "withdrawal", "pulls out", "pulled out", "out of",
+)
+_RETIRED_KEYWORDS = ("retired", "retires", "retirement", "ret")
+
+
+def _tweet_mentions_keyword(text_norm: str, keywords: tuple[str, ...]) -> str | None:
+    """Return the matched keyword if any appears as a whole word/phrase in text_norm.
+
+    text_norm is expected to be lowercased & padded with spaces on both
+    sides so simple substring checks act as word-boundary checks for
+    short tokens like 'wd' and 'ret'.
+    """
+    for kw in keywords:
+        if " " in kw:
+            if kw in text_norm:
+                return kw
+        else:
+            if f" {kw} " in text_norm:
+                return kw
+    return None
+
+
+class XSource:
+    """X / Twitter via a local Nitter instance — top-priority news source.
+
+    Scrapes the @EntryLists timeline (configurable) and parses each tweet
+    for withdrawal / retirement keywords near a target player's last
+    name. EntryLists tweets typically announce a single player pulling
+    out of a tournament, so we hit on EITHER target player's last name
+    appearing alongside a keyword (we do not require both names).
+    """
+
+    name = "x"
+
+    def __init__(self):
+        self.account = config.X_ACCOUNT
+        self.instance = config.X_NITTER_INSTANCE
+        self.fetch_count = config.X_FETCH_COUNT
+        self._scraper = None  # lazy — avoids ntscraper import at module load
+
+    def _get_scraper(self):
+        if self._scraper is not None:
+            return self._scraper
+        try:
+            from ntscraper import Nitter
+            import ntscraper.nitter as ntr
+        except ImportError:
+            logger.warning("ntscraper not installed — X source disabled")
+            return None
+
+        # Same avatar-bug guard as scrape_entrylists.py: ntscraper crashes
+        # with IndexError when a tweet's user block is missing fields.
+        if not getattr(ntr.Nitter._get_user, "_patched", False):
+            _orig = ntr.Nitter._get_user
+
+            def _safe(self, tweet, is_encrypted):
+                try:
+                    return _orig(self, tweet, is_encrypted)
+                except IndexError:
+                    uname = tweet.find("a", class_="username")
+                    fname = tweet.find("a", class_="fullname")
+                    return {
+                        "id": None,
+                        "username": uname.text.lstrip("@") if uname else "unknown",
+                        "fullname": fname.text if fname else "unknown",
+                        "avatar_url": None,
+                    }
+
+            _safe._patched = True
+            ntr.Nitter._get_user = _safe
+
+        self._scraper = Nitter(
+            log_level=1,
+            skip_instance_check=True,
+            instance=self.instance,
+        )
+        return self._scraper
+
+    def fetch_recent(self) -> list[dict]:
+        scraper = self._get_scraper()
+        if scraper is None:
+            return []
+        try:
+            result = scraper.get_tweets(self.account, "user", self.fetch_count)
+            return result.get("tweets", []) or []
+        except Exception:
+            logger.exception("X/Nitter fetch failed for @%s", self.account)
+            return []
+
+    @staticmethod
+    def classify_tweet(text: str, player_a: str, player_b: str) -> tuple[MatchStatus, str]:
+        """Inspect one tweet for a withdrawal/retirement of either player.
+
+        Returns (status, matched_player_name). status is NORMAL when the
+        tweet doesn't apply.
+        """
+        if not text:
+            return MatchStatus.NORMAL, ""
+        text_norm = " " + _normalize(text) + " "
+
+        la = _last_name(player_a)
+        lb = _last_name(player_b)
+        matched = ""
+        if la and f" {la} " in text_norm:
+            matched = player_a
+        elif lb and f" {lb} " in text_norm:
+            matched = player_b
+        if not matched:
+            return MatchStatus.NORMAL, ""
+
+        if _tweet_mentions_keyword(text_norm, _WALKOVER_KEYWORDS):
+            return MatchStatus.WALKOVER, matched
+        if _tweet_mentions_keyword(text_norm, _RETIRED_KEYWORDS):
+            return MatchStatus.RETIRED, matched
+        return MatchStatus.NORMAL, ""
+
 
 class SofascoreSource:
     """Sofascore unofficial JSON API — fast, broad coverage (ATP/WTA/CH/ITF)."""
@@ -215,6 +340,7 @@ class NewsMonitor:
     """
 
     def __init__(self, cache_ttl: float | None = None):
+        self.x = XSource() if config.X_SOURCE_ENABLED else None
         self.sofascore = SofascoreSource()
         self.espn = ESPNSource()
         self._cache_ttl = cache_ttl if cache_ttl is not None else config.NEWS_CACHE_TTL
@@ -229,15 +355,47 @@ class NewsMonitor:
         self._cache[source.name] = (time.time(), events)
         return events
 
+    def _get_x_tweets(self) -> list[dict]:
+        """Cached fetch of recent @EntryLists tweets via Nitter."""
+        if self.x is None:
+            return []
+        cached = self._cache.get(self.x.name)
+        if cached and (time.time() - cached[0]) < self._cache_ttl:
+            return cached[1]
+        tweets = self.x.fetch_recent()
+        self._cache[self.x.name] = (time.time(), tweets)
+        return tweets
+
     def check_match(self, player_a: str, player_b: str) -> NewsCheckResult:
         """Look up a specific match across sources and return the first hit.
 
-        Sources are tried in order of priority. Within each source we scan
-        all of today's events and match on last-name pairs.
+        Sources are tried in order of priority. X (@EntryLists) is the
+        top-priority source because tweet announcements typically lead
+        the structured APIs by minutes. Sofascore and ESPN follow as
+        bulk-event fallbacks.
         """
         sources_tried = 0
 
-        # Source 1: Sofascore (primary)
+        # Source 1: X / @EntryLists (top priority)
+        if self.x is not None:
+            try:
+                tweets = self._get_x_tweets()
+                if tweets:
+                    sources_tried += 1
+                for tweet in tweets:
+                    text = tweet.get("text", "")
+                    status, matched = XSource.classify_tweet(text, player_a, player_b)
+                    if status in (MatchStatus.WALKOVER, MatchStatus.RETIRED):
+                        snippet = " ".join(text.split())[:140]
+                        return NewsCheckResult(
+                            status=status,
+                            source="x",
+                            detail=f"@{self.x.account}: {matched} — {snippet}",
+                        )
+            except Exception:
+                logger.exception("X/Nitter lookup failed")
+
+        # Source 2: Sofascore
         try:
             events = self._get_events(self.sofascore)
             sources_tried += 1
@@ -254,7 +412,7 @@ class NewsMonitor:
         except Exception:
             logger.exception("Sofascore lookup failed")
 
-        # Source 2: ESPN (fallback)
+        # Source 3: ESPN (fallback)
         try:
             events = self._get_events(self.espn)
             sources_tried += 1

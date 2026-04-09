@@ -20,11 +20,16 @@ The arb only works when **the favorite withdraws**. If the underdog withdraws, t
 ```
 main.py                  Orchestrator — runs the poll loop, dispatches buy/sell threads
 withdrawal_monitor.py    Snapshots Polymarket open matches, detects disappearances
-news_monitor.py          Cross-checks detected signals against Sofascore + ESPN
+news_monitor.py          Cross-checks detected signals against X (@EntryLists) → Sofascore → ESPN
 polymarket_client.py     Fetches Gamma tennis events, places CLOB orders
 config.py                All settings loaded from .env
 test_withdrawal_detection.py  Smoke test that simulates a walkover end-to-end
+scrape_entrylists.py     Standalone debug tool — dumps recent @EntryLists withdrawals to JSON
+docker-compose.yaml      Local Nitter + Redis stack — backs the X source
+nitter.conf              Nitter config (placeholder hmac key, replaced on first deploy)
 ```
+
+The bot also depends on a **local Nitter instance** at `http://localhost:8080`. Nitter is a self-hosted X/Twitter front-end that gives the bot access to @EntryLists tweets without going through the official API. It runs as two Docker containers (Nitter + a Redis cache) defined in [docker-compose.yaml](docker-compose.yaml). For local dev, `docker compose up -d` from the repo root is enough — the deploy script handles this automatically on the droplet (see [deploy/README.md](deploy/README.md)).
 
 ### main.py
 
@@ -65,10 +70,13 @@ After either detector fires, `WithdrawalMonitor._news_allows_trade()` consults t
 - a **hard gate** that blocks any trade without confirmation (`NEWS_CHECK_MODE=gate`), or
 - eventually, a **primary trigger** where news drives trades before any price move on Polymarket (`trigger` mode, not yet wired).
 
-Two sources are tried in order. Both are fetched in bulk once per cache window ("today's scheduled tennis matches") and cached for `NEWS_CACHE_TTL` seconds so `check_match()` is O(1) HTTP on a warm cache:
+Three sources are tried in priority order. All three are fetched once per cache window and cached for `NEWS_CACHE_TTL` seconds so `check_match()` is O(1) HTTP on a warm cache:
 
-1. **Sofascore** (`api.sofascore.com/api/v1/sport/tennis/scheduled-events/{date}`) — unofficial JSON, fast, broad coverage (ATP/WTA/Challenger/ITF). Status is read from `event.status.description` / `event.status.type`; values matching `walkover` or `retired` are treated as confirmation.
-2. **ESPN** (`site.api.espn.com/.../tennis/atp/scoreboard` + `wta/scoreboard`) — stable fallback. Status read from `competitions[0].status.type.name`/`description`.
+1. **X / @EntryLists via local Nitter** (`http://localhost:8080`, configurable via `X_NITTER_INSTANCE`) — **top priority**. Scrapes the @EntryLists timeline through a self-hosted Nitter instance and parses each tweet for withdrawal/retirement keywords (`walkover`, `w/o`, `wd`, `withdraw[s|n|al]`, `withdrew`, `pulls out`, `out of`, `scratched`, `retire[s|d|ment]`, `ret`) — word-boundary matched so `wd` and `ret` don't bleed into `forward` / `retreat`. Unlike Sofascore/ESPN, EntryLists tweets typically announce a single player pulling out (not a whole match), so the matcher returns a hit on **either** target's last name appearing alongside a keyword — both names are not required. This is the source most likely to fire first because EntryLists posts withdrawals minutes before structured APIs reflect them.
+2. **Sofascore** (`api.sofascore.com/api/v1/sport/tennis/scheduled-events/{date}`) — unofficial JSON, fast, broad coverage (ATP/WTA/Challenger/ITF). Status is read from `event.status.description` / `event.status.type`; values matching `walkover` or `retired` are treated as confirmation. Both players' last names must appear on the same event.
+3. **ESPN** (`site.api.espn.com/.../tennis/atp/scoreboard` + `wta/scoreboard`) — stable fallback. Status read from `competitions[0].status.type.name`/`description`. Both players' last names must appear on the same event.
+
+The X source degrades gracefully: if Nitter is unreachable (container down, network blip, ntscraper not installed) `XSource` returns an empty list and the lookup falls through to Sofascore + ESPN. The bot never blocks on Nitter.
 
 Player-name matching is fuzzy on last names only. Polymarket uses `"Stefanos Sakellaridis"`; Sofascore uses `"Sakellaridis S."`; ESPN uses either. `_last_name()` normalizes both formats (plus accented characters, multi-part surnames, and `"de Minaur A."`-style nobility particles) so both shapes collapse to `"sakellaridis"`. A match requires *both* players' last names to appear on the same event — one-sided matches are rejected.
 
@@ -83,6 +91,10 @@ Player-name matching is fuzzy on last names only. Polymarket uses `"Stefanos Sak
 | `error` | All sources errored (network, rate limit, schema drift) |
 
 Only `walkover` and `retired` count as confirmation (`result.confirms_withdrawal == True`).
+
+> **Nitter is a runtime dependency.** The X source needs a Nitter instance reachable at `X_NITTER_INSTANCE` (default `http://localhost:8080`) and a populated `sessions.jsonl` of authenticated X account cookies (Nitter no longer works against X's guest API). If either is missing, `XSource` returns empty and the bot falls back to Sofascore + ESPN — it does not crash. Local dev: `docker compose up -d`. Droplet: handled by [deploy/deploy.sh](deploy/deploy.sh) (installs Docker via cloud-init, generates a random `hmacKey` on first deploy, ships `sessions.jsonl` separately with `chmod 600`, waits up to 60s for Nitter to respond before starting the bot).
+
+> **Where the X data lives.** `XSource` does **not** persist tweets to disk in production — it fetches from Nitter, holds the result in an in-memory cache for `NEWS_CACHE_TTL` seconds, scans for matches, and emits `NewsCheckResult` objects that show up in `journalctl -u tennis-arb-bot`. The standalone [scrape_entrylists.py](scrape_entrylists.py) is a separate manual debug tool — running it dumps the latest matched withdrawal tweets to `data/EntryLists_withdrawals.json`. It is not invoked by the bot or by the deploy.
 
 > **Unofficial sources, unstable schemas.** Sofascore and ESPN expose JSON for web clients but do not publish it as a public API. Field names can shift without warning. The `log` mode is specifically designed to make schema drift visible — if every check starts returning `not_found` or `error`, inspect the raw JSON and update `SofascoreSource.classify` / `ESPNSource.classify`. Rate limiting is also a risk; raise `NEWS_CACHE_TTL` if you see HTTP 403 responses in the logs.
 
@@ -111,9 +123,13 @@ All config from environment variables via `.env`:
 | `SELL_TARGET_PRICE` | 0.50 | Target sell price (the 50/50 reset price) |
 | `PRICE_SPIKE_THRESHOLD` | 0.05 | Underdog-side price rise between polls that triggers the primary detector |
 | `DRY_RUN` | true | Set to `false` to execute real trades |
-| `NEWS_CHECK_ENABLED` | true | Master switch for the Sofascore/ESPN confirmation layer |
+| `NEWS_CHECK_ENABLED` | true | Master switch for the X / Sofascore / ESPN confirmation layer |
 | `NEWS_CHECK_MODE` | `log` | `log` = observe only, `gate` = require confirmation, `trigger` = reserved |
 | `NEWS_CACHE_TTL` | 30 | Seconds to cache each news source's "today's events" response |
+| `X_SOURCE_ENABLED` | true | Master switch for the @EntryLists / Nitter source |
+| `X_NITTER_INSTANCE` | `http://localhost:8080` | URL of the local Nitter instance |
+| `X_ACCOUNT` | `EntryLists` | X account whose timeline is scraped for withdrawals |
+| `X_FETCH_COUNT` | 40 | Number of recent tweets to pull on each cache miss |
 
 ## Setup
 
@@ -121,6 +137,14 @@ All config from environment variables via `.env`:
 pip install -r requirements.txt
 cp .env.example .env
 # Fill in your Polymarket API credentials + private key in .env
+
+# Optional but recommended: bring up the local Nitter stack so the X source
+# is live. Without it the bot still runs and falls back to Sofascore/ESPN.
+#   1. Put authenticated X session cookies in sessions.jsonl (gitignored)
+#   2. Replace CHANGE_ME_TO_A_LONG_RANDOM_SECRET in nitter.conf with a real secret
+#   3. docker compose up -d
+#   4. Verify: curl -sf http://localhost:8080/EntryLists >/dev/null && echo OK
+
 python main.py
 ```
 
@@ -153,15 +177,15 @@ Both scenarios exercise the full trading pipeline in `DRY_RUN` (asserted at star
 
 1. **Phase 1 (now):** `NEWS_CHECK_MODE=log`. Collect a week of logs. Measure how often each fired signal is confirmed by a news source vs. returns `not_found` vs. `normal`. That gives us the real false-positive rate of the spike detector.
 2. **Phase 2:** `NEWS_CHECK_MODE=gate`. Block unconfirmed trades. Safer, but loses trades where news lags the order book.
-3. **Phase 3:** add a `trigger` mode where `NewsMonitor` is polled on its own cadence and emits withdrawals directly — no price spike required. The spike+vanish detectors stay on as backups / ground-truth reconciliation. This is the "be faster than the market" mode the bot was originally scoped for.
-4. **Phase 4:** replace/augment Sofascore and ESPN with a true real-time feed — X/Twitter firehose filtered for known tennis journalists, or a paid live-data API — so the bot fires before public websites have even caught up.
+3. **Phase 3:** add a `trigger` mode where `NewsMonitor` is polled on its own cadence and emits withdrawals directly — no price spike required. The spike+vanish detectors stay on as backups / ground-truth reconciliation. This is the "be faster than the market" mode the bot was originally scoped for. Now that the X source is wired in, this is the next step: poll @EntryLists on its own cadence and use a tweet alone as a trigger.
 
-Sources currently used by `NewsMonitor`:
+Sources currently used by `NewsMonitor` (priority order):
+- **X / @EntryLists via Nitter** — fastest known source, often minutes ahead of structured APIs. Depends on a healthy local Nitter instance and valid X session cookies.
 - **Sofascore** — ~1 min latency, broad coverage, unofficial endpoint (rate-limit sensitive)
 - **ESPN** — ~1-2 min latency, stable schema, narrower coverage
 
 Sources worth adding later:
-- **X/Twitter stream** for known tennis journalists (@josemorgado, @BenRothenberg, @TennisChannel, @ATPTour, @WTA)
+- **Additional X journalists** (@josemorgado, @BenRothenberg, @TennisChannel, @ATPTour, @WTA) — same Nitter pipeline, just point a second `XSource` at a different account
 - **ATP/WTA official news feeds** — press releases sometimes beat entry-list updates
 - **Flashscore / Sofascore live stream** for retirement events during matches already in progress
 
@@ -184,8 +208,15 @@ A market can disappear from Gamma for reasons other than a walkover — manual t
 - `py-clob-client` — Official Polymarket CLOB order client
 - `python-dotenv` — .env file loading
 - `websockets` — (reserved for future real-time feeds)
+- `ntscraper` — Python wrapper around Nitter; used by `XSource` and [scrape_entrylists.py](scrape_entrylists.py)
+- `beautifulsoup4` — used by the `_get_user` monkey-patch in `XSource` to recover from an ntscraper avatar-parsing bug
 
-`curl_cffi` and `beautifulsoup4` are still in `requirements.txt` from the previous tennisexplorer-scraping approach. They're currently unused but kept in case Phase 2 brings back browser-impersonating HTTP.
+External runtime dependencies (not pip-installable):
+- **Docker + Docker Compose** — to run the local Nitter + Redis stack
+- **Nitter** (`zedeus/nitter`) — self-hosted X front-end the bot scrapes via ntscraper. Configured by [docker-compose.yaml](docker-compose.yaml) + [nitter.conf](nitter.conf) + `sessions.jsonl`
+- **Valid X session cookies** in `sessions.jsonl` — Nitter's guest API was deprecated, so authenticated sessions are required
+
+`curl_cffi` is still in `requirements.txt` from the previous tennisexplorer-scraping approach. Currently unused but kept in case browser-impersonating HTTP is needed again.
 
 ## Risk notes
 

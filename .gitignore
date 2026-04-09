@@ -2,6 +2,8 @@
 .env
 *.env
 deploy/.do-token
+sessions.jsonl
+sessions.json
 
 # Python
 __pycache__/

@@ -1,7 +1,9 @@
 #cloud-config
 # Provisions a fresh Ubuntu droplet for the tennis arbitrage bot.
-# Installs Python + creates the unprivileged service user. The actual
-# project files and .env are uploaded by deploy.sh after this runs.
+# Installs Python + Docker + creates the unprivileged service user.
+# The actual project files, .env, and sessions.jsonl are uploaded by
+# deploy.sh after this runs. Docker hosts the Nitter + Redis stack
+# that the bot's XSource talks to over localhost:8080.
 
 package_update: true
 package_upgrade: false
@@ -14,6 +16,8 @@ packages:
   - git
   - curl
   - ca-certificates
+  - docker.io
+  - docker-compose-v2
 
 users:
   - name: bot
@@ -25,3 +29,4 @@ runcmd:
   - mkdir -p /opt/tennis-arb-bot
   - chown -R bot:bot /opt/tennis-arb-bot
   - chmod 750 /opt/tennis-arb-bot
+  - systemctl enable --now docker

@@ -1,0 +1,21 @@
+services:
+  nitter-redis:
+    image: redis:7-alpine
+    container_name: nitter-redis
+    restart: unless-stopped
+
+  nitter:
+    image: zedeus/nitter:latest
+    container_name: nitter
+    restart: unless-stopped
+    depends_on:
+      - nitter-redis
+    ports:
+      # Bind to loopback only — Nitter is consumed by the bot on the same
+      # host and must never be reachable from the public internet.
+      - "127.0.0.1:8080:8080"
+    environment:
+      - NITTER_SESSIONS_FILE=/src/sessions.jsonl
+    volumes:
+      - ./nitter.conf:/src/nitter.conf:ro
+      - ./sessions.jsonl:/src/sessions.jsonl:ro
