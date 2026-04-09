@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import config
+from news_monitor import MatchStatus, NewsMonitor
 from polymarket_client import PolymarketClient, TennisMatch
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,15 @@ class WithdrawalMonitor:
     miss, and skips tournaments we have no market on.
     """
 
-    def __init__(self, poly: PolymarketClient | None = None):
+    def __init__(
+        self,
+        poly: PolymarketClient | None = None,
+        news: NewsMonitor | None = None,
+    ):
         self.poly = poly or PolymarketClient()
+        # Optional news-confirmation layer. When None or disabled via config,
+        # the monitor behaves exactly like the pre-news version.
+        self.news = news
         # condition_id -> TennisMatch snapshot from the previous poll
         self._known_matches: dict[str, TennisMatch] = {}
         self._initialized = False
@@ -119,17 +127,20 @@ class WithdrawalMonitor:
 
             delta = curr_underdog_price - prev_underdog_price
             if delta >= config.PRICE_SPIKE_THRESHOLD:
-                w = Withdrawal(
+                logger.warning(
+                    "PRICE SPIKE: %s — underdog %.2f → %.2f (Δ %.2f)",
+                    curr.event_title, prev_underdog_price, curr_underdog_price, delta,
+                )
+                # Dedup regardless of gate decision — we don't want to re-check
+                # the same cid every 10s if gating blocks it.
+                self._emitted.add(cid)
+                if not self._news_allows_trade(curr, "spike"):
+                    continue
+                withdrawals.append(Withdrawal(
                     tournament_name=curr.tournament or "Unknown",
                     tour=self._infer_tour(curr),
                     match=curr,
-                )
-                withdrawals.append(w)
-                self._emitted.add(cid)
-                logger.warning(
-                    "PRICE SPIKE: %s — underdog %.2f → %.2f (Δ %.2f) — will buy underdog",
-                    curr.event_title, prev_underdog_price, curr_underdog_price, delta,
-                )
+                ))
 
         # --- Detector 2: vanish (backup, slow) --------------------------
         # If we missed the spike (or the whole move happened inside one
@@ -146,17 +157,15 @@ class WithdrawalMonitor:
                 logger.debug("Ignoring vanished match (already started): %s", prev.event_title)
                 continue
 
-            w = Withdrawal(
+            logger.warning("VANISH DETECTED: %s", prev.event_title)
+            self._emitted.add(cid)
+            if not self._news_allows_trade(prev, "vanish"):
+                continue
+            withdrawals.append(Withdrawal(
                 tournament_name=prev.tournament or "Unknown",
                 tour=self._infer_tour(prev),
                 match=prev,
-            )
-            withdrawals.append(w)
-            self._emitted.add(cid)
-            logger.warning(
-                "VANISH DETECTED: %s — will buy underdog side",
-                prev.event_title,
-            )
+            ))
 
         # Update snapshot for next poll
         self._known_matches = current_by_cid
@@ -203,3 +212,48 @@ class WithdrawalMonitor:
         if slug.startswith("wta"):
             return "wta"
         return "unknown"
+
+    # ------------------------------------------------------------------
+    # News confirmation
+    # ------------------------------------------------------------------
+
+    def _news_allows_trade(self, m: TennisMatch, detector: str) -> bool:
+        """Consult the news layer for this match and decide whether to trade.
+
+        Always logs the result. Returns True unless we're in 'gate' mode and
+        the news source does not confirm a walkover/retirement. In 'log'
+        mode (the default first-pass configuration) this function is a pure
+        observer — it never blocks a trade, it just records what the news
+        source would have said.
+        """
+        if self.news is None or not config.NEWS_CHECK_ENABLED:
+            return True
+
+        try:
+            result = self.news.check_match(m.player_a, m.player_b)
+        except Exception:
+            logger.exception("News check crashed — defaulting to allow (detector=%s)", detector)
+            return True
+
+        logger.info(
+            "NEWS CHECK [%s]: %s vs %s — %s via %s — %s",
+            detector,
+            m.player_a,
+            m.player_b,
+            result.status.value,
+            result.source,
+            result.detail or "(no detail)",
+        )
+
+        mode = config.NEWS_CHECK_MODE
+        if mode == "gate":
+            if result.confirms_withdrawal:
+                return True
+            logger.warning(
+                "NEWS GATE: blocking trade on '%s' — source=%s status=%s",
+                m.event_title, result.source, result.status.value,
+            )
+            return False
+
+        # 'log' (default) and any unknown mode: observe only, always allow.
+        return True

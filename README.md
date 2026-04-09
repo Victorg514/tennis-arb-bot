@@ -20,6 +20,7 @@ The arb only works when **the favorite withdraws**. If the underdog withdraws, t
 ```
 main.py                  Orchestrator — runs the poll loop, dispatches buy/sell threads
 withdrawal_monitor.py    Snapshots Polymarket open matches, detects disappearances
+news_monitor.py          Cross-checks detected signals against Sofascore + ESPN
 polymarket_client.py     Fetches Gamma tennis events, places CLOB orders
 config.py                All settings loaded from .env
 test_withdrawal_detection.py  Smoke test that simulates a walkover end-to-end
@@ -27,7 +28,8 @@ test_withdrawal_detection.py  Smoke test that simulates a walkover end-to-end
 
 ### main.py
 
-- `Bot` class wires `WithdrawalMonitor` and `PolymarketClient` together
+- `Bot` class wires `WithdrawalMonitor`, `NewsMonitor`, and `PolymarketClient` together
+- `NewsMonitor` is constructed only if `NEWS_CHECK_ENABLED` is true, then passed into `WithdrawalMonitor` as the optional confirmation layer
 - Each tick: `monitor.poll()` → for every withdrawal, build a `MarketMatch` directly from the attached `TennisMatch` → `poly.buy_opponent_shares()`
 - Spawns a daemon thread per buy that runs `poly.monitor_for_reset()` then `poly.sell_shares()`
 - Handles SIGINT/SIGTERM for graceful shutdown and waits up to 10s for pending sell threads
@@ -53,6 +55,39 @@ test_withdrawal_detection.py  Smoke test that simulates a walkover end-to-end
 
 The first call snapshots the state and returns `[]`. Neither detector needs to know *which* player withdrew — the bet is always on the underdog side of the market.
 
+After either detector fires, `WithdrawalMonitor._news_allows_trade()` consults the optional `NewsMonitor` (see below). In `log` mode (the default) the result is written to the log but trades proceed unchanged — this is the "measure the false-positive rate" phase. In `gate` mode the trade is blocked unless a news source confirms a walkover or retirement. Dedup (`_emitted`) runs *before* the gate, so a blocked cid is not re-checked on every subsequent poll.
+
+### news_monitor.py
+
+`NewsMonitor` provides a cross-source confirmation layer for the signals that `WithdrawalMonitor` produces. It is independent of Polymarket and queries public tennis data directly, so it can act as:
+
+- a **false-positive filter** for the price-spike detector (current role, `NEWS_CHECK_MODE=log`), or
+- a **hard gate** that blocks any trade without confirmation (`NEWS_CHECK_MODE=gate`), or
+- eventually, a **primary trigger** where news drives trades before any price move on Polymarket (`trigger` mode, not yet wired).
+
+Two sources are tried in order. Both are fetched in bulk once per cache window ("today's scheduled tennis matches") and cached for `NEWS_CACHE_TTL` seconds so `check_match()` is O(1) HTTP on a warm cache:
+
+1. **Sofascore** (`api.sofascore.com/api/v1/sport/tennis/scheduled-events/{date}`) — unofficial JSON, fast, broad coverage (ATP/WTA/Challenger/ITF). Status is read from `event.status.description` / `event.status.type`; values matching `walkover` or `retired` are treated as confirmation.
+2. **ESPN** (`site.api.espn.com/.../tennis/atp/scoreboard` + `wta/scoreboard`) — stable fallback. Status read from `competitions[0].status.type.name`/`description`.
+
+Player-name matching is fuzzy on last names only. Polymarket uses `"Stefanos Sakellaridis"`; Sofascore uses `"Sakellaridis S."`; ESPN uses either. `_last_name()` normalizes both formats (plus accented characters, multi-part surnames, and `"de Minaur A."`-style nobility particles) so both shapes collapse to `"sakellaridis"`. A match requires *both* players' last names to appear on the same event — one-sided matches are rejected.
+
+`NewsCheckResult.status` is one of:
+
+| Status | Meaning |
+|---|---|
+| `walkover` | Source confirms a walkover — the surviving player advances without playing |
+| `retired` | Source confirms a mid-match retirement |
+| `normal` | Match exists on the source but is scheduled/in-progress/finished normally (= no withdrawal signal) |
+| `not_found` | None of the sources listed this match today — common for Challengers and qualies |
+| `error` | All sources errored (network, rate limit, schema drift) |
+
+Only `walkover` and `retired` count as confirmation (`result.confirms_withdrawal == True`).
+
+> **Unofficial sources, unstable schemas.** Sofascore and ESPN expose JSON for web clients but do not publish it as a public API. Field names can shift without warning. The `log` mode is specifically designed to make schema drift visible — if every check starts returning `not_found` or `error`, inspect the raw JSON and update `SofascoreSource.classify` / `ESPNSource.classify`. Rate limiting is also a risk; raise `NEWS_CACHE_TTL` if you see HTTP 403 responses in the logs.
+
+> **News latency is not zero.** Sofascore typically reflects walkovers within ~1 minute of the official call; ESPN can be 2-3 minutes. Both are *slower* than the price-spike signal (which fires within one poll interval = ~10s). In `log` mode that just shows up as occasional `not_found` results on freshly-broken walkovers — useful signal in itself. In `gate` mode it means some real walkovers will be skipped because the news source is still catching up. If this becomes the dominant failure mode, a natural next step is to retry the news check during the existing 10-minute sell-monitor window and retroactively log the confirmation.
+
 > **Why Polymarket-driven instead of scraping ATP/WTA entry lists?** The earlier version of the bot scraped ATP/WTA/tennisexplorer tournament pages to snapshot entries per tournament. That approach had three fatal gaps:
 > 1. **It missed upcoming tournaments.** ATP Madrid was invisible until the first match was played, even though Polymarket had been listing its markets for days.
 > 2. **It missed qualifying rounds.** Main-draw entry pages don't list qualifiers, but Polymarket lists quali matches.
@@ -76,6 +111,9 @@ All config from environment variables via `.env`:
 | `SELL_TARGET_PRICE` | 0.50 | Target sell price (the 50/50 reset price) |
 | `PRICE_SPIKE_THRESHOLD` | 0.05 | Underdog-side price rise between polls that triggers the primary detector |
 | `DRY_RUN` | true | Set to `false` to execute real trades |
+| `NEWS_CHECK_ENABLED` | true | Master switch for the Sofascore/ESPN confirmation layer |
+| `NEWS_CHECK_MODE` | `log` | `log` = observe only, `gate` = require confirmation, `trigger` = reserved |
+| `NEWS_CACHE_TTL` | 30 | Seconds to cache each news source's "today's events" response |
 
 ## Setup
 
@@ -109,14 +147,23 @@ Both scenarios exercise the full trading pipeline in `DRY_RUN` (asserted at star
 
 ## What still needs to be built
 
-### Even faster external withdrawal signal
+### Promote `news_monitor` from confirmation to primary trigger
 
-Both current detectors are still reactive to Polymarket's own order book — the spike detector sees the move only after *someone else* has started trading on the news. A true news-wire signal would fire before any price moves on Polymarket at all:
-- **X/Twitter stream**: Monitor @EntryLists tweets in real-time
-- **tennisexplorer player pages**: The player profile shows "next match" status; scrape and watch for walkover markings
-- **ATP/WTA news feeds**: Press releases sometimes beat the entry list updates
+`NewsMonitor` currently runs in `log` mode as a passive observer — every signal from the price-spike or vanish detector is cross-checked against Sofascore + ESPN and the result is logged, but the trade decision is unchanged. The natural progression is:
 
-When that lands, the current spike+vanish detectors stay on as backups / ground-truth reconciliation.
+1. **Phase 1 (now):** `NEWS_CHECK_MODE=log`. Collect a week of logs. Measure how often each fired signal is confirmed by a news source vs. returns `not_found` vs. `normal`. That gives us the real false-positive rate of the spike detector.
+2. **Phase 2:** `NEWS_CHECK_MODE=gate`. Block unconfirmed trades. Safer, but loses trades where news lags the order book.
+3. **Phase 3:** add a `trigger` mode where `NewsMonitor` is polled on its own cadence and emits withdrawals directly — no price spike required. The spike+vanish detectors stay on as backups / ground-truth reconciliation. This is the "be faster than the market" mode the bot was originally scoped for.
+4. **Phase 4:** replace/augment Sofascore and ESPN with a true real-time feed — X/Twitter firehose filtered for known tennis journalists, or a paid live-data API — so the bot fires before public websites have even caught up.
+
+Sources currently used by `NewsMonitor`:
+- **Sofascore** — ~1 min latency, broad coverage, unofficial endpoint (rate-limit sensitive)
+- **ESPN** — ~1-2 min latency, stable schema, narrower coverage
+
+Sources worth adding later:
+- **X/Twitter stream** for known tennis journalists (@josemorgado, @BenRothenberg, @TennisChannel, @ATPTour, @WTA)
+- **ATP/WTA official news feeds** — press releases sometimes beat entry-list updates
+- **Flashscore / Sofascore live stream** for retirement events during matches already in progress
 
 ### Position tracking
 
@@ -133,7 +180,7 @@ A market can disappear from Gamma for reasons other than a walkover — manual t
 
 ## Dependencies
 
-- `httpx` — HTTP client for Polymarket Gamma API calls
+- `httpx` — HTTP client for Polymarket Gamma API calls and Sofascore/ESPN lookups
 - `py-clob-client` — Official Polymarket CLOB order client
 - `python-dotenv` — .env file loading
 - `websockets` — (reserved for future real-time feeds)

@@ -23,6 +23,19 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 # which is the whole point of running our own detector.
 PRICE_SPIKE_THRESHOLD = float(os.getenv("PRICE_SPIKE_THRESHOLD", "0.05"))
 
+# News confirmation (Sofascore / ESPN)
+# Mode controls how the news layer affects trading:
+#   'log'     — observe only; every spike/vanish signal is looked up and
+#               the news status is logged, but trades are not affected.
+#               Use this first to measure false-positive rates.
+#   'gate'    — require a confirming walkover/retirement from a news source
+#               before trading. Safer, but misses trades where news lags.
+#   'trigger' — reserved for a future mode where news drives trades
+#               directly (not yet wired in withdrawal_monitor).
+NEWS_CHECK_ENABLED = os.getenv("NEWS_CHECK_ENABLED", "true").lower() == "true"
+NEWS_CHECK_MODE = os.getenv("NEWS_CHECK_MODE", "log").lower()
+NEWS_CACHE_TTL = float(os.getenv("NEWS_CACHE_TTL", "30"))
+
 # Polymarket API
 POLY_CLOB_URL = "https://clob.polymarket.com"
 POLY_GAMMA_URL = "https://gamma-api.polymarket.com"

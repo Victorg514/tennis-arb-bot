@@ -12,6 +12,7 @@ import threading
 import time
 
 import config
+from news_monitor import NewsMonitor
 from polymarket_client import PolymarketClient, MarketMatch
 from withdrawal_monitor import WithdrawalMonitor, Withdrawal
 
@@ -30,7 +31,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 class Bot:
     def __init__(self):
         self.poly = PolymarketClient()
-        self.monitor = WithdrawalMonitor(poly=self.poly)
+        self.news = NewsMonitor() if config.NEWS_CHECK_ENABLED else None
+        self.monitor = WithdrawalMonitor(poly=self.poly, news=self.news)
         self._running = False
         self._sell_threads: list[threading.Thread] = []
 
@@ -39,8 +41,11 @@ class Bot:
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
 
-        logger.info("Bot started (DRY_RUN=%s, POLL_INTERVAL=%ds, MAX_BET=$%.2f)",
-                     config.DRY_RUN, config.POLL_INTERVAL, config.MAX_BET_USDC)
+        logger.info(
+            "Bot started (DRY_RUN=%s, POLL_INTERVAL=%ds, MAX_BET=$%.2f, NEWS_CHECK=%s/%s)",
+            config.DRY_RUN, config.POLL_INTERVAL, config.MAX_BET_USDC,
+            "on" if config.NEWS_CHECK_ENABLED else "off", config.NEWS_CHECK_MODE,
+        )
 
         while self._running:
             try:

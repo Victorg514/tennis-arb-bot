@@ -1,7 +1,6 @@
 # Environment / secrets
 .env
 *.env
-.env.example
 deploy/.do-token
 
 # Python
